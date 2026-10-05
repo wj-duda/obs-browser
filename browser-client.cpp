@@ -41,6 +41,271 @@ inline bool BrowserClient::valid() const
 	return !!bs && !bs->destroying;
 }
 
+namespace {
+bool IsYouTubeEmbedFrame(const CefString &url)
+{
+	CefURLParts parts;
+	if (!CefParseURL(url, parts))
+		return false;
+
+	const std::string scheme = CefString(&parts.scheme);
+	const std::string host = CefString(&parts.host);
+	const std::string path = CefString(&parts.path);
+
+	const bool supportedScheme = scheme == "https" || scheme == "http";
+	const bool supportedHost = host == "youtube.com" || host == "www.youtube.com" ||
+				   host == "youtube-nocookie.com" || host == "www.youtube-nocookie.com";
+	const bool embedPath = path.size() > 7 && path.rfind("/embed/", 0) == 0;
+
+	return supportedScheme && supportedHost && embedPath;
+}
+
+constexpr const char *youtubeQualityWatchdog = R"YTQJS(
+(() => {
+    const PREFIX = '[YTQ]';
+
+    if (window.__obsYouTubeQualityWatchdogInstalled) {
+        console.info(`${PREFIX} watchdog already installed`);
+        return;
+    }
+
+    window.__obsYouTubeQualityWatchdogInstalled = true;
+
+    const QUALITY_ORDER = [
+        'highres',
+        'hd2160',
+        'hd1440',
+        'hd1080',
+        'hd720',
+        'large',
+        'medium',
+        'small',
+        'tiny'
+    ];
+    const TARGET = 'hd1080';
+    const CHECK_INTERVAL_MS = 500;
+    const APPLY_COOLDOWN_MS = 2000;
+    const VERIFY_DELAY_MS = 1000;
+
+    let lastVideoId = null;
+    let lastObservedQuality = null;
+    let lastAvailableSignature = null;
+    let lastSelectedTarget = null;
+    let lastApplyAt = -Infinity;
+    let forceCount = 0;
+    let downgradeCount = 0;
+    let retryCount = 0;
+    let methodUnavailableLogged = false;
+    let firstSeenAt = performance.now();
+
+    function getPlayer() {
+        return document.getElementById('movie_player') ||
+            document.querySelector('.html5-video-player');
+    }
+
+    function getVideoId(player) {
+        try {
+            const data = player?.getVideoData?.();
+            if (data?.video_id)
+                return data.video_id;
+        } catch (_) {}
+
+        const match = location.pathname.match(/^\/embed\/([^/?]+)/);
+        return match ? match[1] : 'unknown';
+    }
+
+    function getCurrentQuality(player) {
+        try {
+            if (typeof player.getPlaybackQuality === 'function')
+                return player.getPlaybackQuality();
+        } catch (_) {}
+
+        return 'unknown';
+    }
+
+    function getAvailableLevels(player) {
+        try {
+            if (typeof player.getAvailableQualityLevels === 'function') {
+                const levels = player.getAvailableQualityLevels();
+                if (Array.isArray(levels))
+                    return levels;
+            }
+        } catch (_) {}
+
+        return [];
+    }
+
+    function selectTarget(levels) {
+        if (!Array.isArray(levels) || levels.length === 0)
+            return null;
+
+        if (levels.includes(TARGET))
+            return TARGET;
+
+        for (const quality of QUALITY_ORDER) {
+            if (levels.includes(quality))
+                return quality;
+        }
+
+        return null;
+    }
+
+    function applyQuality(player, videoId, target) {
+        if (typeof player.setPlaybackQualityRange !== 'function')
+            return false;
+
+        const now = performance.now();
+        if (now - lastApplyAt < APPLY_COOLDOWN_MS)
+            return false;
+
+        lastApplyAt = now;
+
+        try {
+            player.setPlaybackQualityRange(target, target);
+            forceCount++;
+
+            console.info(
+                `${PREFIX} FORCE video=${videoId} target=${target} ` +
+                `forceCount=${forceCount}`
+            );
+
+            setTimeout(() => {
+                const currentPlayer = getPlayer();
+                if (!currentPlayer || getVideoId(currentPlayer) !== videoId)
+                    return;
+
+                console.info(
+                    `${PREFIX} VERIFY video=${videoId} requested=${target} ` +
+                    `actual=${getCurrentQuality(currentPlayer)} ` +
+                    `elapsedMs=${Math.round(performance.now() - firstSeenAt)}`
+                );
+            }, VERIFY_DELAY_MS);
+
+            return true;
+        } catch (error) {
+            console.error(`${PREFIX} setPlaybackQualityRange failed video=${videoId}`, error);
+            return false;
+        }
+    }
+
+    function check(reason = 'interval') {
+        const player = getPlayer();
+
+        if (!player) {
+            retryCount++;
+            if (retryCount <= 10 || retryCount % 20 === 0) {
+                console.info(
+                    `${PREFIX} player not ready retry=${retryCount} reason=${reason}`
+                );
+            }
+            return;
+        }
+
+        const videoId = getVideoId(player);
+        const quality = getCurrentQuality(player);
+        const levels = getAvailableLevels(player);
+        const signature = levels.join(',');
+
+        if (videoId !== lastVideoId) {
+            lastVideoId = videoId;
+            lastObservedQuality = null;
+            lastAvailableSignature = null;
+            lastSelectedTarget = null;
+            lastApplyAt = -Infinity;
+            forceCount = 0;
+            downgradeCount = 0;
+            retryCount = 0;
+            methodUnavailableLogged = false;
+            firstSeenAt = performance.now();
+
+            console.info(`${PREFIX} VIDEO_CHANGED video=${videoId}`);
+            console.info(
+                `${PREFIX} CAPABILITIES video=${videoId} ` +
+                `levels=${typeof player.getAvailableQualityLevels === 'function'} ` +
+                `current=${typeof player.getPlaybackQuality === 'function'} ` +
+                `range=${typeof player.setPlaybackQualityRange === 'function'}`
+            );
+        }
+
+        if (signature !== lastAvailableSignature) {
+            lastAvailableSignature = signature;
+            console.info(`${PREFIX} AVAILABLE video=${videoId} levels=[${signature}]`);
+        }
+
+        if (quality !== lastObservedQuality) {
+            const previous = lastObservedQuality;
+            lastObservedQuality = quality;
+
+            console.info(
+                `${PREFIX} QUALITY_CHANGED video=${videoId} ` +
+                `from=${previous ?? 'none'} to=${quality} reason=${reason}`
+            );
+
+            if (previous && previous === lastSelectedTarget && quality !== lastSelectedTarget) {
+                downgradeCount++;
+                console.warn(
+                    `${PREFIX} DOWNGRADE video=${videoId} from=${previous} ` +
+                    `to=${quality} downgrades=${downgradeCount}`
+                );
+            }
+        }
+
+        const target = selectTarget(levels);
+        if (!target) {
+            retryCount++;
+            if (retryCount <= 10 || retryCount % 20 === 0) {
+                console.info(
+                    `${PREFIX} quality levels not ready video=${videoId} ` +
+                    `retry=${retryCount}`
+                );
+            }
+            return;
+        }
+
+        if (target !== lastSelectedTarget) {
+            lastSelectedTarget = target;
+            console.info(
+                `${PREFIX} TARGET video=${videoId} preferred=${TARGET} selected=${target}`
+            );
+        }
+
+        if (typeof player.setPlaybackQualityRange !== 'function') {
+            if (!methodUnavailableLogged) {
+                methodUnavailableLogged = true;
+                console.error(
+                    `${PREFIX} METHOD_UNAVAILABLE video=${videoId} ` +
+                    'method=setPlaybackQualityRange'
+                );
+            }
+            return;
+        }
+
+        if (quality === target)
+            return;
+
+        if (performance.now() - lastApplyAt < APPLY_COOLDOWN_MS)
+            return;
+
+        console.info(
+            `${PREFIX} APPLY video=${videoId} current=${quality} target=${target} ` +
+            `elapsedMs=${Math.round(performance.now() - firstSeenAt)}`
+        );
+        applyQuality(player, videoId, target);
+    }
+
+    console.info(`${PREFIX} watchdog installed url=${location.href}`);
+
+    [0, 100, 250, 500, 1000, 2000, 4000].forEach(delay => {
+        setTimeout(() => check(`startup-${delay}`), delay);
+    });
+
+    setInterval(() => check('interval'), CHECK_INTERVAL_MS);
+    document.addEventListener('fullscreenchange', () => check('fullscreen'));
+    window.addEventListener('resize', () => check('resize'));
+})();
+)YTQJS";
+} // namespace
+
 CefRefPtr<CefLoadHandler> BrowserClient::GetLoadHandler()
 {
 	return this;
@@ -612,6 +877,14 @@ void BrowserClient::OnLoadEnd(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, 
 		return;
 	}
 
+	const CefString frameUrl = frame->GetURL();
+	if (IsYouTubeEmbedFrame(frameUrl)) {
+		const std::string url = frameUrl.ToString();
+		blog(LOG_INFO, "[YTQ] YouTube iframe detected: %s", url.c_str());
+		frame->ExecuteJavaScript(youtubeQualityWatchdog, frameUrl, 0);
+		blog(LOG_INFO, "[YTQ] Quality watchdog injected: %s", url.c_str());
+	}
+
 	if (frame->IsMain() && bs->css.length()) {
 		std::string uriEncodedCSS = CefURIEncode(bs->css, false).ToString();
 
@@ -629,6 +902,18 @@ void BrowserClient::OnLoadEnd(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, 
 bool BrowserClient::OnConsoleMessage(CefRefPtr<CefBrowser>, cef_log_severity_t level, const CefString &message,
 				     const CefString &source, int line)
 {
+	const std::string consoleMessage = message.ToString();
+	const char *sourceName = "<unknown>";
+
+	if (bs && bs->source)
+		sourceName = obs_source_get_name(bs->source);
+
+	if (consoleMessage.rfind("[YTQ]", 0) == 0) {
+		blog(LOG_INFO, "[obs-browser: '%s'] %s (%s:%d)", sourceName, consoleMessage.c_str(),
+		     source.ToString().c_str(), line);
+		return false;
+	}
+
 	int errorLevel = LOG_INFO;
 	const char *code = "Info";
 	switch (level) {
@@ -643,11 +928,6 @@ bool BrowserClient::OnConsoleMessage(CefRefPtr<CefBrowser>, cef_log_severity_t l
 	default:
 		return false;
 	}
-
-	const char *sourceName = "<unknown>";
-
-	if (bs && bs->source)
-		sourceName = obs_source_get_name(bs->source);
 
 	blog(errorLevel, "[obs-browser: '%s'] %s: %s (%s:%d)", sourceName, code, message.ToString().c_str(),
 	     source.ToString().c_str(), line);
