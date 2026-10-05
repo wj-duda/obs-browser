@@ -55,7 +55,7 @@ bool IsYouTubeEmbedFrame(const CefString &url)
 	const bool supportedScheme = scheme == "https" || scheme == "http";
 	const bool supportedHost = host == "youtube.com" || host == "www.youtube.com" ||
 				   host == "youtube-nocookie.com" || host == "www.youtube-nocookie.com";
-	const bool embedPath = path.size() > 7 && path.rfind("/embed/", 0) == 0;
+	const bool embedPath = path == "/embed" || path.rfind("/embed/", 0) == 0;
 
 	return supportedScheme && supportedHost && embedPath;
 }
